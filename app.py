@@ -20,7 +20,7 @@ PESOS_NOMINALES = {
     16: 1.578, 20: 2.466, 25: 3.853, 32: 6.313,
 }
 COLUMNAS = ["Posición", "Diámetro (mm)", "Cantidad", "Longitud (m)"]
-TOLERANCIA_CORTE_M = 0.01
+TOLERANCIA_CORTE_MM = 10
 NUMERO_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
 
 
@@ -195,12 +195,15 @@ def extraer_lista_hierros(archivo: Any) -> pd.DataFrame:
     raise ValueError("Formato no admitido. Carga un archivo PDF o DXF.")
 
 
-def generar_patrones(longitudes: list[float], demandas: list[int], longitud_barra: float,
-                     kerf_m: float, limite: int = 25000) -> list[tuple[int, ...]]:
-    """Genera patrones que permiten una diferencia acumulada máxima de 1 cm."""
-    consumos = [longitud + kerf_m for longitud in longitudes]
+def generar_patrones(longitudes_mm: list[int], demandas: list[int], longitud_barra_mm: int,
+                     kerf_mm: int, limite: int = 25000) -> list[tuple[int, ...]]:
+    """Genera patrones enteros en mm, con una tolerancia acumulada de 10 mm."""
+    longitudes_mm = [int(x) for x in longitudes_mm]
+    demandas = [int(x) for x in demandas]
+    longitud_barra_mm, kerf_mm = int(longitud_barra_mm), int(kerf_mm)
+    consumos = [int(longitud) + kerf_mm for longitud in longitudes_mm]
     patrones: set[tuple[int, ...]] = set()
-    n = len(longitudes)
+    n = int(len(longitudes_mm))
 
     def agregar(patron: list[int]) -> None:
         if any(patron):
@@ -208,7 +211,7 @@ def generar_patrones(longitudes: list[float], demandas: list[int], longitud_barr
 
     # Patrones unitarios: factibilidad garantizada ante una enumeración limitada.
     for i, consumo in enumerate(consumos):
-        if consumo <= longitud_barra + TOLERANCIA_CORTE_M:
+        if int(consumo) <= longitud_barra_mm + TOLERANCIA_CORTE_MM:
             patron = [0] * n
             patron[i] = 1
             agregar(patron)
@@ -219,44 +222,49 @@ def generar_patrones(longitudes: list[float], demandas: list[int], longitud_barr
         if indice == n:
             agregar(actual)
             return
-        maximo = min(demandas[indice], int((restante + TOLERANCIA_CORTE_M) // consumos[indice]))
-        for cantidad in range(maximo, -1, -1):
-            actual.append(cantidad)
-            recorrer(indice + 1, restante - cantidad * consumos[indice], actual)
+        maximo = min(int(demandas[indice]), int((int(restante) + TOLERANCIA_CORTE_MM) // int(consumos[indice])))
+        for cantidad in range(int(maximo), -1, -1):
+            actual.append(int(cantidad))
+            recorrer(int(indice) + 1, int(restante) - int(cantidad) * int(consumos[indice]), actual)
             actual.pop()
             if len(patrones) >= limite:
                 return
 
-    recorrer(0, longitud_barra, [])
+    recorrer(0, longitud_barra_mm, [])
     # Añade patrones densos cuando se corta la enumeración por el límite.
-    for inicio in range(n):
-        restante, patron = longitud_barra, [0] * n
-        for i in [inicio] + [x for x in range(n) if x != inicio]:
-            cantidad = min(demandas[i], int((restante + TOLERANCIA_CORTE_M) // consumos[i]))
+    for inicio in range(int(n)):
+        restante, patron = int(longitud_barra_mm), [0] * n
+        for i in [inicio] + [x for x in range(int(n)) if x != inicio]:
+            cantidad = min(int(demandas[i]), int((int(restante) + TOLERANCIA_CORTE_MM) // int(consumos[i])))
             if cantidad:
-                patron[i] = cantidad
-                restante -= cantidad * consumos[i]
+                patron[i] = int(cantidad)
+                restante -= int(cantidad) * int(consumos[i])
         agregar(patron)
     return sorted(patrones, key=lambda p: (sum(p), p), reverse=True)
 
 
-def resolver_diametro(datos: pd.DataFrame, longitud_barra: float, kerf_m: float,
-                      minimo_reutilizable: float) -> dict[str, Any]:
+def resolver_diametro(datos: pd.DataFrame, longitud_barra_mm: int, kerf_mm: int,
+                      minimo_reutilizable_mm: int) -> dict[str, Any]:
     # Defensa adicional: evita que una llamada futura al motor omita la limpieza
     # aplicada por la interfaz y pase texto a range() o al solver MIP.
     datos = preparar_datos_para_optimizacion(datos)
     datos = datos[(datos["Cantidad"] > 0) & (datos["Longitud (m)"] > 0)]
-    demanda = datos.groupby("Longitud (m)", sort=False)["Cantidad"].sum().sort_index(ascending=False)
-    longitudes, demandas = [float(x) for x in demanda.index], [int(x) for x in demanda.values]
-    no_caben = [x for x in longitudes if x + kerf_m > longitud_barra + TOLERANCIA_CORTE_M]
+    longitud_barra_mm = int(longitud_barra_mm)
+    kerf_mm = int(kerf_mm)
+    minimo_reutilizable_mm = int(minimo_reutilizable_mm)
+    datos["Longitud (mm)"] = (datos["Longitud (m)"] * 1000).round().astype(int)
+    demanda = datos.groupby("Longitud (mm)", sort=False)["Cantidad"].sum().sort_index(ascending=False)
+    longitudes_mm = [int(x) for x in demanda.index]
+    demandas = [int(x) for x in demanda.values]
+    no_caben = [x for x in longitudes_mm if int(x) + kerf_mm > longitud_barra_mm + TOLERANCIA_CORTE_MM]
     if no_caben:
-        raise ValueError(f"Piezas que no caben en una barra incluso con tolerancia: {no_caben}")
-    patrones = generar_patrones(longitudes, demandas, longitud_barra, kerf_m)
+        raise ValueError(f"Piezas que no caben en una barra incluso con tolerancia: {[x / 1000 for x in no_caben]}")
+    patrones = generar_patrones(longitudes_mm, demandas, longitud_barra_mm, kerf_mm)
     solver = pywraplp.Solver.CreateSolver("SCIP") or pywraplp.Solver.CreateSolver("CBC_MIXED_INTEGER_PROGRAMMING")
     if solver is None:
         raise RuntimeError("No fue posible iniciar el solver SCIP/CBC de OR-Tools.")
     solver.SetTimeLimit(30_000)
-    variables = [solver.IntVar(0, solver.infinity(), f"patron_{i}") for i in range(len(patrones))]
+    variables = [solver.IntVar(0, solver.infinity(), f"patron_{i}") for i in range(int(len(patrones)))]
     for tipo, cantidad in enumerate(demandas):
         solver.Add(sum(patron[tipo] * variables[i] for i, patron in enumerate(patrones)) == cantidad)
     objetivo = solver.Objective()
@@ -267,36 +275,37 @@ def resolver_diametro(datos: pd.DataFrame, longitud_barra: float, kerf_m: float,
     if estado not in (pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE):
         raise RuntimeError("El solver no encontró un plan de corte factible.")
 
-    etiquetas: dict[float, deque[str]] = defaultdict(deque)
-    for _, fila in datos.sort_values(["Longitud (m)", "Posición"], ascending=[False, True]).iterrows():
-        etiquetas[float(fila["Longitud (m)"])].extend([str(fila["Posición"])] * int(fila["Cantidad"]))
+    etiquetas: dict[int, deque[str]] = defaultdict(deque)
+    for _, fila in datos.sort_values(["Longitud (mm)", "Posición"], ascending=[False, True]).iterrows():
+        etiquetas[int(fila["Longitud (mm)"])].extend([str(fila["Posición"])] * int(fila["Cantidad"]))
     cortes_individuales: list[dict[str, Any]] = []
     retazos: list[dict[str, Any]] = []
     for i, patron in enumerate(patrones):
         for _ in range(int(round(variables[i].solution_value()))):
-            piezas, metros_piezas = [], 0.0
+            piezas, milimetros_piezas = [], 0
             for tipo, cantidad in enumerate(patron):
-                for _ in range(cantidad):
-                    piezas.append((etiquetas[longitudes[tipo]].popleft(), longitudes[tipo]))
-                    metros_piezas += longitudes[tipo]
-            sobrante_fisico = longitud_barra - metros_piezas - kerf_m * len(piezas)
+                for _ in range(int(cantidad)):
+                    largo_mm = int(longitudes_mm[int(tipo)])
+                    piezas.append((etiquetas[largo_mm].popleft(), largo_mm))
+                    milimetros_piezas += largo_mm
+            sobrante_fisico_mm = longitud_barra_mm - milimetros_piezas - kerf_mm * int(len(piezas))
             # Un déficit máximo de 1 cm es tolerancia admisible, no sobrante negativo.
-            sobrante = max(0.0, sobrante_fisico)
-            clasificacion = ("Sobrante de Stock" if sobrante + 1e-9 >= minimo_reutilizable
+            sobrante_mm = max(0, int(sobrante_fisico_mm))
+            clasificacion = ("Sobrante de Stock" if sobrante_mm >= minimo_reutilizable_mm
                              else "Desperdicio / Chatarra")
-            conteo_piezas: dict[tuple[str, float], int] = {}
-            for posicion, largo in piezas:
-                clave = (posicion, largo)
+            conteo_piezas: dict[tuple[str, int], int] = {}
+            for posicion, largo_mm in piezas:
+                clave = (posicion, int(largo_mm))
                 conteo_piezas[clave] = conteo_piezas.get(clave, 0) + 1
             patron = " + ".join(
-                f"{cantidad}x {posicion} ({largo:.2f} m)"
-                for (posicion, largo), cantidad in conteo_piezas.items()
+                f"{int(cantidad)}x {posicion} ({largo_mm / 1000:.2f} m)"
+                for (posicion, largo_mm), cantidad in conteo_piezas.items()
             )
             cortes_individuales.append({"Patrón de Corte": patron,
-                                        "Sobrante por Barra (m)": sobrante,
+                                        "Sobrante por Barra (m)": sobrante_mm / 1000,
                                         "Clasificación": clasificacion})
             if clasificacion == "Sobrante de Stock":
-                retazos.append({"Longitud (m)": sobrante})
+                retazos.append({"Longitud (m)": sobrante_mm / 1000})
     grupos: dict[tuple[str, float, str], int] = {}
     for corte in cortes_individuales:
         clave = (corte["Patrón de Corte"], round(corte["Sobrante por Barra (m)"], 6), corte["Clasificación"])
@@ -307,25 +316,32 @@ def resolver_diametro(datos: pd.DataFrame, longitud_barra: float, kerf_m: float,
         for (patron, sobrante, clasificacion), cantidad in grupos.items()
     ]
     return {"barras": len(cortes_individuales), "cortes": cortes, "retazos": retazos,
-            "metros_piezas": sum(largo * cantidad for largo, cantidad in zip(longitudes, demandas)),
+            "metros_piezas": sum(int(largo) * int(cantidad) for largo, cantidad in zip(longitudes_mm, demandas)) / 1000,
             "metros_chatarra": sum(c["Sobrante por Barra (m)"] for c in cortes_individuales
                                     if c["Clasificación"] == "Desperdicio / Chatarra")}
 
 
 def optimizar(datos: pd.DataFrame, longitud_barra: float, kerf_cm: float,
               minimo_reutilizable: float) -> dict[str, Any]:
-    kerf_m = kerf_cm / 100
+    # El solver trabaja exclusivamente con enteros en milímetros.
+    longitud_barra_m = float(longitud_barra)
+    longitud_barra_mm = int(longitud_barra_m * 1000)
+    kerf_mm = int(float(kerf_cm) * 10)
+    minimo_reutilizable_mm = int(float(minimo_reutilizable) * 1000)
+    if longitud_barra_mm <= 0:
+        raise ValueError("La longitud comercial debe ser mayor que cero.")
     resumen, cortes, retazos = [], [], []
     for diametro, grupo in datos.groupby("Diámetro (mm)", sort=True):
-        peso = peso_nominal(float(diametro))
-        solucion = resolver_diametro(grupo, longitud_barra, kerf_m, minimo_reutilizable)
+        diametro = int(diametro)
+        peso = peso_nominal(diametro)
+        solucion = resolver_diametro(grupo, longitud_barra_mm, kerf_mm, minimo_reutilizable_mm)
         for corte in solucion["cortes"]:
-            corte["Diámetro (mm)"] = float(diametro)
+            corte["Diámetro (mm)"] = int(diametro)
             cortes.append(corte)
         for retazo in solucion["retazos"]:
-            retazo["Diámetro (mm)"] = float(diametro)
+            retazo["Diámetro (mm)"] = int(diametro)
             retazos.append(retazo)
-        resumen.append({"Diámetro (mm)": float(diametro), "Barras a comprar": solucion["barras"],
+        resumen.append({"Diámetro (mm)": int(diametro), "Barras a comprar": int(solucion["barras"]),
                         "Metros de piezas": solucion["metros_piezas"],
                         "Kg de piezas": solucion["metros_piezas"] * peso,
                         "Kg de chatarra": solucion["metros_chatarra"] * peso})
@@ -345,7 +361,7 @@ def optimizar(datos: pd.DataFrame, longitud_barra: float, kerf_cm: float,
     total_barras = int(df_resumen["Barras a comprar"].sum())
     metros_piezas = float(df_resumen["Metros de piezas"].sum())
     return {"resumen": df_resumen, "cortes": df_cortes, "retazos": df_retazos,
-            "aprovechamiento": 100 * metros_piezas / (total_barras * longitud_barra) if total_barras else 0.0,
+            "aprovechamiento": 100 * metros_piezas / (total_barras * longitud_barra_m) if total_barras else 0.0,
             "kg_total": float(df_resumen["Kg de piezas"].sum()),
             "kg_chatarra": float(df_resumen["Kg de chatarra"].sum())}
 
