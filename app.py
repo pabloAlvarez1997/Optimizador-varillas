@@ -1,366 +1,458 @@
-"""Optimizador de corte de barras de acero a partir de una lista de hierros."""
+"""Aplicación Streamlit para optimizar el corte de barras de acero por diámetro."""
 from __future__ import annotations
 
-from collections import Counter, defaultdict, deque
-from io import BytesIO
+from collections import defaultdict, deque
+from io import BytesIO, StringIO
 import math
 import re
-from typing import Any
+from typing import Any, Iterable
 
+import ezdxf
 import pandas as pd
 import pdfplumber
 import streamlit as st
 from ortools.linear_solver import pywraplp
 
 
+# Pesos lineales teóricos de acero, en kg/m. Esta es la única fuente de peso.
+PESOS_NOMINALES = {
+    6: 0.222, 8: 0.395, 10: 0.617, 12: 0.888,
+    16: 1.578, 20: 2.466, 25: 3.853, 32: 6.313,
+}
 COLUMNAS = ["Posición", "Diámetro (mm)", "Cantidad", "Longitud (m)"]
-PATRON_NUMERO = re.compile(r"-?\d+(?:[.,]\d+)?")
+TOLERANCIA_CORTE_M = 0.01
+NUMERO_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
 
 
-def a_numero(valor: Any) -> float | None:
-    """Convierte números de planos, incluidos formatos 1.200,50 y 1,20."""
+def convertir_numero(valor: Any) -> float | None:
+    """Convierte formatos de planos, incluidos 1.200,50 y 1,20."""
     if valor is None or (isinstance(valor, float) and math.isnan(valor)):
         return None
-    texto = str(valor).strip().replace(" ", "")
-    if not texto:
+    coincidencia = NUMERO_RE.search(str(valor).replace(" ", ""))
+    if not coincidencia:
         return None
-    texto = texto.replace("Ø", "").replace("ø", "").replace("∅", "")
-    encontrado = PATRON_NUMERO.search(texto)
-    if not encontrado:
-        return None
-    numero = encontrado.group(0)
-    if "," in numero and "." in numero:
-        # El último separador suele ser el decimal.
-        if numero.rfind(",") > numero.rfind("."):
-            numero = numero.replace(".", "").replace(",", ".")
-        else:
-            numero = numero.replace(",", "")
+    texto = coincidencia.group(0)
+    if "," in texto and "." in texto:
+        texto = (texto.replace(".", "").replace(",", ".")
+                 if texto.rfind(",") > texto.rfind(".") else texto.replace(",", ""))
     else:
-        numero = numero.replace(",", ".")
+        texto = texto.replace(",", ".")
     try:
-        return float(numero)
+        return float(texto)
     except ValueError:
         return None
 
 
-def normalizar_longitud(valor: Any) -> float | None:
-    n = a_numero(valor)
-    if n is None or n <= 0:
+def convertir_longitud_m(valor: Any) -> float | None:
+    """Normaliza longitudes de PDF/DXF en m, cm o mm a metros."""
+    numero = convertir_numero(valor)
+    if numero is None or numero <= 0:
         return None
-    # En planos de armaduras la longitud suele figurar en cm o mm. Se conserva
-    # explícitamente la unidad cuando está indicada; sin unidad, 100+ es mm y
-    # 10--100 se interpreta como cm, que es el formato más habitual.
     texto = str(valor).lower().replace(" ", "")
-    if "mm" in texto or ("m" not in texto and n >= 100):
-        return n / 1000
-    if "cm" in texto or ("m" not in texto and 10 <= n < 100):
-        return n / 100
-    return n
+    if "mm" in texto or ("m" not in texto and numero >= 100):
+        return numero / 1000
+    if "cm" in texto or ("m" not in texto and 10 <= numero < 100):
+        return numero / 100
+    return numero
 
 
-def _encabezado_indice(celdas: list[Any], terminos: tuple[str, ...]) -> int | None:
-    for i, celda in enumerate(celdas):
+def peso_nominal(diametro: float) -> float:
+    """Devuelve solo el peso de tabla para un diámetro admitido."""
+    for diametro_tabla, peso in PESOS_NOMINALES.items():
+        if abs(float(diametro) - diametro_tabla) < 1e-8:
+            return peso
+    admitidos = ", ".join(str(x) for x in PESOS_NOMINALES)
+    raise ValueError(f"Ø {diametro:g} mm no tiene peso nominal. Admitidos: {admitidos} mm.")
+
+
+def indice_columna(celdas: list[Any], terminos: tuple[str, ...]) -> int | None:
+    for indice, celda in enumerate(celdas):
         texto = str(celda or "").lower()
-        if any(t in texto for t in terminos):
-            return i
+        if any(termino in texto for termino in terminos):
+            return indice
     return None
 
 
-def _filas_de_tablas(pagina: Any) -> list[list[Any]]:
-    filas: list[list[Any]] = []
-    for tabla in pagina.extract_tables():
-        filas.extend(fila for fila in tabla if fila)
-    return filas
+def es_encabezado(celdas: list[Any]) -> tuple[int, int, int, int] | None:
+    posicion = indice_columna(celdas, ("pos", "marca", "item"))
+    diametro = indice_columna(celdas, ("diá", "diam", "ø", "φ", "∅"))
+    cantidad = indice_columna(celdas, ("cant", "unid", "qty", "quant"))
+    longitud = indice_columna(celdas, ("long", "largo", "length"))
+    if None in (posicion, diametro, cantidad, longitud):
+        return None
+    return posicion, diametro, cantidad, longitud
 
 
-def extraer_lista_hierros(pdf: Any) -> pd.DataFrame:
-    """Extrae filas de tablas con posición, diámetro, cantidad y longitud.
-
-    Acepta bytes o un objeto UploadedFile. El resultado siempre se puede editar;
-    por ello se privilegia recuperar datos plausibles antes que descartar una fila
-    por una cabecera imperfecta del PDF.
-    """
-    contenido = pdf if isinstance(pdf, bytes) else pdf.getvalue()
+def registros_desde_filas(filas: Iterable[list[Any]]) -> list[dict[str, Any]]:
     registros: list[dict[str, Any]] = []
-    with pdfplumber.open(BytesIO(contenido)) as documento:
-        for pagina in documento.pages:
-            filas = _filas_de_tablas(pagina)
-            encabezados: list[Any] | None = None
-            indices: tuple[int, int, int, int] | None = None
-            for fila in filas:
-                pos = _encabezado_indice(fila, ("pos", "marca", "nº", "no."))
-                diam = _encabezado_indice(fila, ("diá", "diam", "ø", "φ", "∅"))
-                cant = _encabezado_indice(fila, ("cant", "unid", "n°"))
-                largo = _encabezado_indice(fila, ("long", "largo", "length"))
-                if None not in (pos, diam, cant, largo):
-                    encabezados, indices = fila, (pos, diam, cant, largo)
-                    continue
-                if indices is None:
-                    continue
-                try:
-                    p, d, c, l = (fila[i] for i in indices)
-                except IndexError:
-                    continue
-                diametro, cantidad, longitud = a_numero(d), a_numero(c), normalizar_longitud(l)
-                if p and diametro and cantidad and longitud:
-                    registros.append({
-                        "Posición": str(p).strip(), "Diámetro (mm)": diametro,
-                        "Cantidad": int(round(cantidad)), "Longitud (m)": longitud,
-                    })
+    encabezado: tuple[int, int, int, int] | None = None
+    for fila in filas:
+        fila = list(fila)
+        encontrado = es_encabezado(fila)
+        if encontrado is not None:
+            encabezado = encontrado
+            continue
+        if encabezado is None:
+            continue
+        try:
+            pos, diam, cant, largo = (fila[i] for i in encabezado)
+        except IndexError:
+            continue
+        d, c, l = convertir_numero(diam), convertir_numero(cant), convertir_longitud_m(largo)
+        if pos not in (None, "") and d and c and l:
+            registros.append({"Posición": str(pos).strip(), "Diámetro (mm)": d,
+                              "Cantidad": int(round(c)), "Longitud (m)": l})
+    return registros
 
-            # Respaldo para PDFs en los que la tabla se extrajo como texto plano.
-            if not registros and not filas:
-                for linea in (pagina.extract_text() or "").splitlines():
-                    partes = re.split(r"\s+", linea.strip())
-                    if len(partes) < 4:
-                        continue
-                    diam_i = next((i for i, x in enumerate(partes) if re.search(r"[Øø∅]", x)), None)
-                    if diam_i is None or diam_i == 0 or diam_i + 2 >= len(partes):
-                        continue
-                    d, c, l = a_numero(partes[diam_i]), a_numero(partes[diam_i + 1]), normalizar_longitud(partes[diam_i + 2])
-                    if d and c and l:
-                        registros.append({"Posición": partes[0], "Diámetro (mm)": d,
-                                          "Cantidad": int(round(c)), "Longitud (m)": l})
+
+def registros_desde_texto(texto: str) -> list[dict[str, Any]]:
+    """Respaldo para planillas que el origen expone como texto plano."""
+    registros: list[dict[str, Any]] = []
+    for linea in texto.splitlines():
+        partes = [p for p in re.split(r"\s+", linea.strip()) if p]
+        if len(partes) < 4:
+            continue
+        i_diametro = next((i for i, p in enumerate(partes) if re.search(r"[Øø∅φΦ]", p)), 1)
+        if i_diametro == 0 or i_diametro + 2 >= len(partes):
+            continue
+        d = convertir_numero(partes[i_diametro])
+        c = convertir_numero(partes[i_diametro + 1])
+        l = convertir_longitud_m(partes[i_diametro + 2])
+        if d and c and l and c.is_integer() and c > 0:
+            registros.append({"Posición": partes[0], "Diámetro (mm)": d,
+                              "Cantidad": int(c), "Longitud (m)": l})
+    return registros
+
+
+def normalizar_registros(registros: list[dict[str, Any]]) -> pd.DataFrame:
     if not registros:
         return pd.DataFrame(columns=COLUMNAS)
     resultado = pd.DataFrame(registros, columns=COLUMNAS).drop_duplicates()
     return resultado.sort_values(["Diámetro (mm)", "Posición"]).reset_index(drop=True)
 
 
-def generar_patrones(longitudes: list[float], demandas: list[int], barra: float, kerf: float,
-                     limite: int = 25000) -> list[tuple[int, ...]]:
-    """Enumera patrones viables. Cada pieza consume su longitud y un kerf."""
-    usados = [x + kerf for x in longitudes]
+def extraer_lista_hierros_pdf(contenido: bytes) -> pd.DataFrame:
+    registros: list[dict[str, Any]] = []
+    texto_completo: list[str] = []
+    with pdfplumber.open(BytesIO(contenido)) as documento:
+        for pagina in documento.pages:
+            filas: list[list[Any]] = []
+            for tabla in pagina.extract_tables():
+                filas.extend(fila for fila in tabla if fila)
+            registros.extend(registros_desde_filas(filas))
+            texto_completo.append(pagina.extract_text() or "")
+    if not registros:
+        registros = registros_desde_texto("\n".join(texto_completo))
+    return normalizar_registros(registros)
+
+
+def _filas_dxf_por_coordenada(contenido: bytes) -> tuple[list[list[str]], str]:
+    """Construye filas visuales a partir de entidades TEXT y MTEXT de un DXF."""
+    try:
+        documento = ezdxf.read(StringIO(contenido.decode("utf-8", errors="ignore")))
+    except Exception as exc:
+        raise ValueError(f"El archivo DXF no es legible: {exc}") from exc
+    elementos: list[tuple[float, float, str]] = []
+    for entidad in documento.modelspace():
+        if entidad.dxftype() == "TEXT":
+            texto = entidad.dxf.text
+        elif entidad.dxftype() == "MTEXT":
+            texto = entidad.plain_text()
+        else:
+            continue
+        texto = str(texto).replace("\\P", " ").strip()
+        if texto:
+            punto = entidad.dxf.insert
+            elementos.append((float(punto.y), float(punto.x), texto))
+    if not elementos:
+        return [], ""
+    elementos.sort(key=lambda e: (-e[0], e[1]))
+    grupos: list[list[tuple[float, float, str]]] = []
+    for elemento in elementos:
+        if not grupos or abs(grupos[-1][0][0] - elemento[0]) > 2.0:
+            grupos.append([elemento])
+        else:
+            grupos[-1].append(elemento)
+    filas = [[texto for _, _, texto in sorted(grupo, key=lambda e: e[1])] for grupo in grupos]
+    return filas, "\n".join(" ".join(fila) for fila in filas)
+
+
+def extraer_lista_hierros_dxf(contenido: bytes) -> pd.DataFrame:
+    filas, texto = _filas_dxf_por_coordenada(contenido)
+    registros = registros_desde_filas(filas)
+    if not registros:
+        registros = registros_desde_texto(texto)
+    return normalizar_registros(registros)
+
+
+def extraer_lista_hierros(archivo: Any) -> pd.DataFrame:
+    """Extrae la lista de hierros desde un UploadedFile PDF o DXF."""
+    nombre, contenido = archivo.name.lower(), archivo.getvalue()
+    if nombre.endswith(".pdf"):
+        return extraer_lista_hierros_pdf(contenido)
+    if nombre.endswith(".dxf"):
+        return extraer_lista_hierros_dxf(contenido)
+    raise ValueError("Formato no admitido. Carga un archivo PDF o DXF.")
+
+
+def generar_patrones(longitudes: list[float], demandas: list[int], longitud_barra: float,
+                     kerf_m: float, limite: int = 25000) -> list[tuple[int, ...]]:
+    """Genera patrones que permiten una diferencia acumulada máxima de 1 cm."""
+    consumos = [longitud + kerf_m for longitud in longitudes]
     patrones: set[tuple[int, ...]] = set()
     n = len(longitudes)
 
-    def agregar(vector: list[int]) -> None:
-        if any(vector):
-            patrones.add(tuple(vector))
+    def agregar(patron: list[int]) -> None:
+        if any(patron):
+            patrones.add(tuple(patron))
 
-    # Los patrones unitarios garantizan factibilidad aun si se alcanza el límite.
-    for i, uso in enumerate(usados):
-        if uso <= barra + 1e-9:
-            v = [0] * n
-            v[i] = 1
-            agregar(v)
+    # Patrones unitarios: factibilidad garantizada ante una enumeración limitada.
+    for i, consumo in enumerate(consumos):
+        if consumo <= longitud_barra + TOLERANCIA_CORTE_M:
+            patron = [0] * n
+            patron[i] = 1
+            agregar(patron)
 
-    def explorar(indice: int, restante: float, actual: list[int]) -> None:
+    def recorrer(indice: int, restante: float, actual: list[int]) -> None:
         if len(patrones) >= limite:
             return
         if indice == n:
             agregar(actual)
             return
-        maximo = min(demandas[indice], int((restante + 1e-9) // usados[indice]))
+        maximo = min(demandas[indice], int((restante + TOLERANCIA_CORTE_M) // consumos[indice]))
         for cantidad in range(maximo, -1, -1):
             actual.append(cantidad)
-            explorar(indice + 1, restante - cantidad * usados[indice], actual)
+            recorrer(indice + 1, restante - cantidad * consumos[indice], actual)
             actual.pop()
             if len(patrones) >= limite:
                 return
 
-    explorar(0, barra, [])
-    # Agrega patrones de llenado greedy desde cada tipo, útiles con gran variedad.
+    recorrer(0, longitud_barra, [])
+    # Añade patrones densos cuando se corta la enumeración por el límite.
     for inicio in range(n):
-        restante, v = barra, [0] * n
-        for i in [inicio] + [j for j in range(n) if j != inicio]:
-            cantidad = min(demandas[i], int((restante + 1e-9) // usados[i]))
+        restante, patron = longitud_barra, [0] * n
+        for i in [inicio] + [x for x in range(n) if x != inicio]:
+            cantidad = min(demandas[i], int((restante + TOLERANCIA_CORTE_M) // consumos[i]))
             if cantidad:
-                v[i] = cantidad
-                restante -= cantidad * usados[i]
-        agregar(v)
+                patron[i] = cantidad
+                restante -= cantidad * consumos[i]
+        agregar(patron)
     return sorted(patrones, key=lambda p: (sum(p), p), reverse=True)
 
 
-def resolver_diametro(datos: pd.DataFrame, barra: float, kerf: float, umbral: float) -> dict[str, Any]:
-    agrupado = datos.groupby("Longitud (m)", sort=False)["Cantidad"].sum().sort_index(ascending=False)
-    longitudes = [float(x) for x in agrupado.index]
-    demandas = [int(x) for x in agrupado.values]
-    if any(l + kerf > barra + 1e-9 for l in longitudes):
-        invalidas = [l for l in longitudes if l + kerf > barra + 1e-9]
-        raise ValueError(f"Hay piezas que no caben en una barra: {invalidas}")
-    patrones = generar_patrones(longitudes, demandas, barra, kerf)
+def resolver_diametro(datos: pd.DataFrame, longitud_barra: float, kerf_m: float,
+                      minimo_reutilizable: float) -> dict[str, Any]:
+    demanda = datos.groupby("Longitud (m)", sort=False)["Cantidad"].sum().sort_index(ascending=False)
+    longitudes, demandas = [float(x) for x in demanda.index], [int(x) for x in demanda.values]
+    no_caben = [x for x in longitudes if x + kerf_m > longitud_barra + TOLERANCIA_CORTE_M]
+    if no_caben:
+        raise ValueError(f"Piezas que no caben en una barra incluso con tolerancia: {no_caben}")
+    patrones = generar_patrones(longitudes, demandas, longitud_barra, kerf_m)
     solver = pywraplp.Solver.CreateSolver("SCIP") or pywraplp.Solver.CreateSolver("CBC_MIXED_INTEGER_PROGRAMMING")
     if solver is None:
-        raise RuntimeError("OR-Tools no pudo inicializar SCIP ni CBC.")
-    solver.SetTimeLimit(30000)
+        raise RuntimeError("No fue posible iniciar el solver SCIP/CBC de OR-Tools.")
+    solver.SetTimeLimit(30_000)
     variables = [solver.IntVar(0, solver.infinity(), f"patron_{i}") for i in range(len(patrones))]
-    for i, demanda in enumerate(demandas):
-        solver.Add(sum(p[i] * variables[j] for j, p in enumerate(patrones)) == demanda)
+    for tipo, cantidad in enumerate(demandas):
+        solver.Add(sum(patron[tipo] * variables[i] for i, patron in enumerate(patrones)) == cantidad)
     objetivo = solver.Objective()
     for variable in variables:
         objetivo.SetCoefficient(variable, 1)
     objetivo.SetMinimization()
     estado = solver.Solve()
     if estado not in (pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE):
-        raise RuntimeError("No se encontró una solución factible para este diámetro.")
+        raise RuntimeError("El solver no encontró un plan de corte factible.")
 
-    # Etiquetas de posiciones para que el taller pueda identificar cada pieza.
     etiquetas: dict[float, deque[str]] = defaultdict(deque)
     for _, fila in datos.sort_values(["Longitud (m)", "Posición"], ascending=[False, True]).iterrows():
         etiquetas[float(fila["Longitud (m)"])].extend([str(fila["Posición"])] * int(fila["Cantidad"]))
-    cortes, retazos = [], []
-    numero = 1
-    for j, patron in enumerate(patrones):
-        for _ in range(int(round(variables[j].solution_value()))):
-            piezas: list[str] = []
-            longitud_cortada = 0.0
-            for i, cantidad in enumerate(patron):
+    cortes: list[dict[str, Any]] = []
+    retazos: list[dict[str, Any]] = []
+    numero_barra = 1
+    for i, patron in enumerate(patrones):
+        for _ in range(int(round(variables[i].solution_value()))):
+            piezas, metros_piezas = [], 0.0
+            for tipo, cantidad in enumerate(patron):
                 for _ in range(cantidad):
-                    etiqueta = etiquetas[longitudes[i]].popleft()
-                    piezas.append(f"{etiqueta}: {longitudes[i]:.3f} m")
-                    longitud_cortada += longitudes[i]
-            sobrante = max(0.0, barra - longitud_cortada - kerf * len(piezas))
-            es_util = sobrante + 1e-9 >= umbral
-            cortes.append({"Barra N°": numero, "Piezas a cortar": " | ".join(piezas),
-                           "Longitud piezas (m)": longitud_cortada, "Kerf total (m)": kerf * len(piezas),
-                           "Sobrante residual (m)": sobrante,
-                           "Clasificación": "Retazo útil" if es_util else "Chatarra"})
-            if es_util:
-                retazos.append({"Barra origen": numero, "Longitud (m)": sobrante})
-            numero += 1
-    return {"cortes": cortes, "retazos": retazos, "barras": numero - 1,
-            "metros_piezas": sum(l * q for l, q in zip(longitudes, demandas)),
-            "metros_chatarra": sum(x["Sobrante residual (m)"] for x in cortes if x["Clasificación"] == "Chatarra")}
+                    piezas.append(f"{etiquetas[longitudes[tipo]].popleft()}: {longitudes[tipo]:.2f} m")
+                    metros_piezas += longitudes[tipo]
+            sobrante_fisico = longitud_barra - metros_piezas - kerf_m * len(piezas)
+            # Un déficit máximo de 1 cm es tolerancia admisible, no sobrante negativo.
+            sobrante = max(0.0, sobrante_fisico)
+            clasificacion = ("Sobrante de Stock" if sobrante + 1e-9 >= minimo_reutilizable
+                             else "Desperdicio / Chatarra")
+            cortes.append({"Barra N°": numero_barra, "Piezas a cortar": " | ".join(piezas),
+                           "Metros de piezas": metros_piezas, "Kerf total (m)": kerf_m * len(piezas),
+                           "Sobrante (m)": sobrante, "Clasificación": clasificacion})
+            if clasificacion == "Sobrante de Stock":
+                retazos.append({"Barra origen": numero_barra, "Longitud (m)": sobrante})
+            numero_barra += 1
+    return {"barras": numero_barra - 1, "cortes": cortes, "retazos": retazos,
+            "metros_piezas": sum(largo * cantidad for largo, cantidad in zip(longitudes, demandas)),
+            "metros_chatarra": sum(c["Sobrante (m)"] for c in cortes
+                                    if c["Clasificación"] == "Desperdicio / Chatarra")}
 
 
-def optimizar(datos: pd.DataFrame, barra: float, kerf_cm: float, umbral: float) -> dict[str, Any]:
-    kerf = kerf_cm / 100
-    cortes, retazos, resumen = [], [], []
+def optimizar(datos: pd.DataFrame, longitud_barra: float, kerf_cm: float,
+              minimo_reutilizable: float) -> dict[str, Any]:
+    kerf_m = kerf_cm / 100
+    resumen, cortes, retazos = [], [], []
     for diametro, grupo in datos.groupby("Diámetro (mm)", sort=True):
-        solucion = resolver_diametro(grupo, barra, kerf, umbral)
-        for fila in solucion["cortes"]:
-            fila["Diámetro (mm)"] = float(diametro)
-            cortes.append(fila)
-        for fila in solucion["retazos"]:
-            fila["Diámetro (mm)"] = float(diametro)
-            retazos.append(fila)
-        kg_piezas = solucion["metros_piezas"] * float(diametro) ** 2 / 162
-        kg_chatarra = solucion["metros_chatarra"] * float(diametro) ** 2 / 162
+        peso = peso_nominal(float(diametro))
+        solucion = resolver_diametro(grupo, longitud_barra, kerf_m, minimo_reutilizable)
+        for corte in solucion["cortes"]:
+            corte["Diámetro (mm)"] = float(diametro)
+            cortes.append(corte)
+        for retazo in solucion["retazos"]:
+            retazo["Diámetro (mm)"] = float(diametro)
+            retazos.append(retazo)
         resumen.append({"Diámetro (mm)": float(diametro), "Barras a comprar": solucion["barras"],
-                        "Metros de piezas": solucion["metros_piezas"], "Kg de piezas": kg_piezas,
-                        "Kg de chatarra": kg_chatarra})
+                        "Metros de piezas": solucion["metros_piezas"],
+                        "Kg de piezas": solucion["metros_piezas"] * peso,
+                        "Kg de chatarra": solucion["metros_chatarra"] * peso})
     df_resumen = pd.DataFrame(resumen)
     total_barras = int(df_resumen["Barras a comprar"].sum())
-    total_piezas = float(df_resumen["Metros de piezas"].sum())
+    metros_piezas = float(df_resumen["Metros de piezas"].sum())
     return {"resumen": df_resumen, "cortes": pd.DataFrame(cortes), "retazos": pd.DataFrame(retazos),
-            "aprovechamiento": 100 * total_piezas / (total_barras * barra) if total_barras else 0,
+            "aprovechamiento": 100 * metros_piezas / (total_barras * longitud_barra) if total_barras else 0.0,
             "kg_total": float(df_resumen["Kg de piezas"].sum()),
             "kg_chatarra": float(df_resumen["Kg de chatarra"].sum())}
 
 
-def crear_excel(resultado: dict[str, Any], barra: float, kerf_cm: float, umbral: float) -> bytes:
+def redondear_para_mostrar(df: pd.DataFrame) -> pd.DataFrame:
+    resultado = df.copy()
+    enteros = {"Barra N°", "Barras a comprar", "Barra origen"}
+    for columna in resultado.select_dtypes(include="number").columns:
+        if columna not in enteros:
+            resultado[columna] = resultado[columna].round(2)
+    return resultado
+
+
+def crear_excel(resultado: dict[str, Any], longitud_barra: float, kerf_cm: float,
+                minimo_reutilizable: float) -> bytes:
+    """Genera las tres hojas solicitadas, con formato numérico de dos decimales."""
     salida = BytesIO()
     with pd.ExcelWriter(salida, engine="xlsxwriter") as escritor:
         libro = escritor.book
-        titulo = libro.add_format({"bold": True, "bg_color": "#1F4E78", "font_color": "#FFFFFF"})
-        numero = libro.add_format({"num_format": "0.000"})
-        general = resultado["resumen"].copy()
-        general.loc[len(general)] = {"Diámetro (mm)": "TOTAL", "Barras a comprar": int(general["Barras a comprar"].sum()),
-                                     "Metros de piezas": general["Metros de piezas"].sum(), "Kg de piezas": resultado["kg_total"],
-                                     "Kg de chatarra": resultado["kg_chatarra"]}
-        general.to_excel(escritor, sheet_name="Resumen General", index=False, startrow=5)
+        encabezado = libro.add_format({"bold": True, "bg_color": "#1F4E78", "font_color": "#FFFFFF"})
+        dos_decimales = libro.add_format({"num_format": "0.00"})
+        porcentaje = libro.add_format({"num_format": "0.00%"})
+        resumen = resultado["resumen"].copy()
+        total = {"Diámetro (mm)": "TOTAL", "Barras a comprar": int(resumen["Barras a comprar"].sum()),
+                 "Metros de piezas": resumen["Metros de piezas"].sum(), "Kg de piezas": resultado["kg_total"],
+                 "Kg de chatarra": resultado["kg_chatarra"]}
+        resumen = pd.concat([resumen, pd.DataFrame([total])], ignore_index=True)
+        resumen.to_excel(escritor, sheet_name="Resumen General", index=False, startrow=5)
         hoja = escritor.sheets["Resumen General"]
-        hoja.write("A1", "Configuración", titulo)
-        hoja.write_row("A2", ["Longitud barra (m)", barra, "Kerf (cm)", kerf_cm, "Umbral retazo (m)", umbral])
-        hoja.write_row("A3", ["Aprovechamiento global", resultado["aprovechamiento"] / 100, "Kg totales", resultado["kg_total"], "Kg chatarra", resultado["kg_chatarra"]])
-        hoja.set_column("A:A", 18); hoja.set_column("B:E", 18, numero); hoja.set_column("F:F", 18)
-        for col, nombre in enumerate(general.columns): hoja.write(5, col, nombre, titulo)
-        resultado["cortes"].to_excel(escritor, sheet_name="Plan de Corte Detallado", index=False)
-        detalle = escritor.sheets["Plan de Corte Detallado"]
-        detalle.set_column("A:A", 13); detalle.set_column("B:B", 16); detalle.set_column("C:C", 65); detalle.set_column("D:F", 22, numero)
-        for col, nombre in enumerate(resultado["cortes"].columns): detalle.write(0, col, nombre, titulo)
-        inventario = resultado["retazos"]
+        hoja.write("A1", "Configuración", encabezado)
+        hoja.write_row("A2", ["Longitud barra (m)", longitud_barra, "Kerf (cm)", kerf_cm,
+                                "Longitud mínima reutilizable (m)", minimo_reutilizable])
+        hoja.write("A3", "Aprovechamiento global", encabezado)
+        hoja.write_number("B3", resultado["aprovechamiento"] / 100, porcentaje)
+        hoja.write("D3", "Kg totales", encabezado); hoja.write_number("E3", resultado["kg_total"], dos_decimales)
+        hoja.write("F3", "Kg chatarra", encabezado); hoja.write_number("G3", resultado["kg_chatarra"], dos_decimales)
+        for i, nombre in enumerate(resumen.columns): hoja.write(5, i, nombre, encabezado)
+        hoja.set_column("A:A", 18); hoja.set_column("B:E", 20, dos_decimales)
+
+        detalle = resultado["cortes"].copy()
+        detalle.to_excel(escritor, sheet_name="Plan de Corte Detallado", index=False)
+        hoja = escritor.sheets["Plan de Corte Detallado"]
+        for i, nombre in enumerate(detalle.columns): hoja.write(0, i, nombre, encabezado)
+        hoja.set_column("A:B", 16); hoja.set_column("C:C", 65); hoja.set_column("D:G", 22, dos_decimales)
+
+        inventario = resultado["retazos"].copy()
         if inventario.empty:
             inventario = pd.DataFrame(columns=["Diámetro (mm)", "Barra origen", "Longitud (m)"])
-        inventario.to_excel(escritor, sheet_name="Inventario Retazos Útiles", index=False)
-        inv = escritor.sheets["Inventario Retazos Útiles"]; inv.set_column("A:C", 22, numero)
-        for col, nombre in enumerate(inventario.columns): inv.write(0, col, nombre, titulo)
+        inventario.to_excel(escritor, sheet_name="Inventario Sobrantes Stock", index=False)
+        hoja = escritor.sheets["Inventario Sobrantes Stock"]
+        for i, nombre in enumerate(inventario.columns): hoja.write(0, i, nombre, encabezado)
+        hoja.set_column("A:C", 24, dos_decimales)
     return salida.getvalue()
 
 
-def limpiar_datos(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+def validar_datos(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     errores: list[str] = []
     datos = df.copy()
-    for col in ("Diámetro (mm)", "Cantidad", "Longitud (m)"):
-        datos[col] = pd.to_numeric(datos[col], errors="coerce")
+    for columna in ("Diámetro (mm)", "Cantidad", "Longitud (m)"):
+        datos[columna] = pd.to_numeric(datos[columna], errors="coerce")
     datos["Posición"] = datos["Posición"].fillna("").astype(str).str.strip()
     datos = datos.dropna(subset=["Diámetro (mm)", "Cantidad", "Longitud (m)"])
     datos = datos[(datos["Diámetro (mm)"] > 0) & (datos["Cantidad"] > 0) & (datos["Longitud (m)"] > 0)]
     if datos.empty:
-        errores.append("Agrega al menos una fila válida con posición, diámetro, cantidad y longitud.")
-    if not datos.empty:
-        datos["Cantidad"] = datos["Cantidad"].round().astype(int)
-        datos["Diámetro (mm)"] = datos["Diámetro (mm)"].round(3)
-        datos["Longitud (m)"] = datos["Longitud (m)"].round(4)
-        datos.loc[datos["Posición"] == "", "Posición"] = [f"Sin posición {i + 1}" for i in range((datos["Posición"] == "").sum())]
+        return pd.DataFrame(columns=COLUMNAS), ["Ingresa al menos una fila válida antes de optimizar."]
+    if not (datos["Cantidad"] % 1 == 0).all():
+        errores.append("La cantidad de cada posición debe ser un número entero.")
+    datos["Cantidad"] = datos["Cantidad"].round().astype(int)
+    datos["Diámetro (mm)"] = datos["Diámetro (mm)"].round(8)
+    datos["Longitud (m)"] = datos["Longitud (m)"].round(4)
+    for diametro in sorted(datos["Diámetro (mm)"].unique()):
+        try: peso_nominal(float(diametro))
+        except ValueError as exc: errores.append(str(exc))
+    vacias = datos["Posición"] == ""
+    datos.loc[vacias, "Posición"] = [f"Sin posición {i + 1}" for i in range(int(vacias.sum()))]
     return datos[COLUMNAS], errores
 
 
 st.set_page_config(page_title="Optimizador de corte de acero", layout="wide")
 st.title("Optimizador de corte de varillas de acero")
-st.caption("Carga una lista de hierros desde un plano PDF, corrígela si hace falta y genera el plan de corte por diámetro.")
-
+st.caption("Carga una lista de hierros PDF o DXF, revísala y obtén el plan de corte separado por diámetro.")
 with st.sidebar:
     st.header("Configuración")
-    longitud_barra = st.number_input("Longitud de barra (m)", min_value=0.1, value=12.0, step=0.1)
-    kerf = st.number_input("Desgaste del disco / kerf (cm)", min_value=0.0, value=0.0, step=0.1)
-    umbral = st.number_input("¿Desde qué longitud un sobrante es Retazo Útil? (m)", min_value=0.0, value=0.50, step=0.05)
-    archivo = st.file_uploader("Plano en PDF", type=["pdf"])
+    longitud_barra = st.number_input("Longitud de barra (m)", min_value=0.10, value=12.00, step=0.10, format="%.2f")
+    kerf_cm = st.number_input("Desgaste del disco / kerf (cm)", min_value=0.00, value=0.00, step=0.10, format="%.2f")
+    minimo_reutilizable = st.number_input("Longitud mínima reutilizable (m)", min_value=0.00, value=0.50, step=0.05, format="%.2f")
+    archivo = st.file_uploader("Plano o planilla", type=["pdf", "dxf"])
+    st.caption("Tolerancia de corte aplicada: ±0.01 m.")
 
-if "datos" not in st.session_state:
-    st.session_state.datos = pd.DataFrame(columns=COLUMNAS)
+if "datos_hierros" not in st.session_state:
+    st.session_state.datos_hierros = pd.DataFrame(columns=COLUMNAS)
 if archivo is not None:
     identificador = (archivo.name, archivo.size)
-    if st.session_state.get("pdf_actual") != identificador:
+    if st.session_state.get("archivo_actual") != identificador:
         try:
-            st.session_state.datos = extraer_lista_hierros(archivo)
-            st.session_state.pdf_actual = identificador
-            if st.session_state.datos.empty:
-                st.warning("No se detectaron filas automáticamente. Completa la tabla manualmente.")
-            else:
-                st.success(f"Se extrajeron {len(st.session_state.datos)} filas. Verifica los valores antes de optimizar.")
+            st.session_state.datos_hierros = extraer_lista_hierros(archivo)
+            st.session_state.archivo_actual = identificador
+            if st.session_state.datos_hierros.empty: st.warning("No se detectaron filas. Completa la tabla manualmente.")
+            else: st.success(f"Se extrajeron {len(st.session_state.datos_hierros)} filas. Revísalas antes de optimizar.")
         except Exception as exc:
-            st.session_state.datos = pd.DataFrame(columns=COLUMNAS)
-            st.error(f"No se pudo leer el PDF: {exc}. Puedes cargar la lista manualmente.")
+            st.session_state.datos_hierros = pd.DataFrame(columns=COLUMNAS)
+            st.error(f"No se pudo extraer la lista: {exc}")
 
 st.subheader("Lista de hierros")
-editado = st.data_editor(st.session_state.datos, num_rows="dynamic", use_container_width=True,
-                         column_config={"Posición": st.column_config.TextColumn(required=True),
-                                        "Diámetro (mm)": st.column_config.NumberColumn(min_value=0.1, format="%.3f"),
-                                        "Cantidad": st.column_config.NumberColumn(min_value=1, step=1),
-                                        "Longitud (m)": st.column_config.NumberColumn(min_value=0.001, format="%.4f")},
-                         key="editor_hierros")
-st.session_state.datos = editado
-
+editado = st.data_editor(
+    st.session_state.datos_hierros, num_rows="dynamic", use_container_width=True, key="editor_lista_hierros",
+    column_config={"Posición": st.column_config.TextColumn("Posición", required=True),
+                   "Diámetro (mm)": st.column_config.NumberColumn("Diámetro Ø (mm)", min_value=0.01, format="%.2f"),
+                   "Cantidad": st.column_config.NumberColumn("Cantidad", min_value=1, step=1, format="%d"),
+                   "Longitud (m)": st.column_config.NumberColumn("Longitud (m)", min_value=0.01, format="%.2f")},
+)
+st.session_state.datos_hierros = editado
 if st.button("Optimizar plan de corte", type="primary", use_container_width=True):
-    datos_validos, errores = limpiar_datos(editado)
-    if longitud_barra <= 0 or umbral < 0:
-        errores.append("La longitud de barra y el umbral deben ser válidos.")
+    datos, errores = validar_datos(editado)
+    if longitud_barra <= 0: errores.append("La longitud de barra debe ser mayor que cero.")
     if errores:
         for error in errores: st.error(error)
     else:
         try:
             with st.spinner("Calculando patrones óptimos por diámetro..."):
-                st.session_state.resultado = optimizar(datos_validos, longitud_barra, kerf, umbral)
-                st.session_state.config_resultado = (longitud_barra, kerf, umbral)
+                st.session_state.resultado = optimizar(datos, longitud_barra, kerf_cm, minimo_reutilizable)
+                st.session_state.config_resultado = (longitud_barra, kerf_cm, minimo_reutilizable)
         except Exception as exc:
             st.error(f"No fue posible optimizar: {exc}")
 
 if "resultado" in st.session_state:
     resultado = st.session_state.resultado
     st.subheader("Resultado")
-    a, b, c = st.columns(3)
-    a.metric("Barras a comprar", int(resultado["resumen"]["Barras a comprar"].sum()))
-    b.metric("Aprovechamiento global", f"{resultado['aprovechamiento']:.2f}%")
-    c.metric("Chatarra estimada", f"{resultado['kg_chatarra']:.2f} kg")
-    st.dataframe(resultado["resumen"], use_container_width=True, hide_index=True)
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Barras a comprar", int(resultado["resumen"]["Barras a comprar"].sum()))
+    col2.metric("Aprovechamiento global", f"{resultado['aprovechamiento']:.2f}%")
+    col3.metric("Chatarra estimada", f"{resultado['kg_chatarra']:.2f} kg")
+    st.dataframe(redondear_para_mostrar(resultado["resumen"]), use_container_width=True, hide_index=True)
     st.subheader("Plan de corte detallado")
-    st.dataframe(resultado["cortes"], use_container_width=True, hide_index=True)
-    st.subheader("Inventario de retazos útiles")
-    st.dataframe(resultado["retazos"], use_container_width=True, hide_index=True)
-    cfg = st.session_state.config_resultado
-    st.download_button("Descargar reporte Excel", data=crear_excel(resultado, *cfg),
-                       file_name="plan_corte_acero.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    st.dataframe(redondear_para_mostrar(resultado["cortes"]), use_container_width=True, hide_index=True)
+    st.subheader("Inventario de sobrantes de stock")
+    st.dataframe(redondear_para_mostrar(resultado["retazos"]), use_container_width=True, hide_index=True)
+    st.download_button("Descargar reporte Excel", data=crear_excel(resultado, *st.session_state.config_resultado),
+                       file_name="plan_corte_acero.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                        use_container_width=True)
+
