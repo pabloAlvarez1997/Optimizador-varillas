@@ -242,6 +242,10 @@ def generar_patrones(longitudes: list[float], demandas: list[int], longitud_barr
 
 def resolver_diametro(datos: pd.DataFrame, longitud_barra: float, kerf_m: float,
                       minimo_reutilizable: float) -> dict[str, Any]:
+    # Defensa adicional: evita que una llamada futura al motor omita la limpieza
+    # aplicada por la interfaz y pase texto a range() o al solver MIP.
+    datos = preparar_datos_para_optimizacion(datos)
+    datos = datos[(datos["Cantidad"] > 0) & (datos["Longitud (m)"] > 0)]
     demanda = datos.groupby("Longitud (m)", sort=False)["Cantidad"].sum().sort_index(ascending=False)
     longitudes, demandas = [float(x) for x in demanda.index], [int(x) for x in demanda.values]
     no_caben = [x for x in longitudes if x + kerf_m > longitud_barra + TOLERANCIA_CORTE_M]
@@ -397,20 +401,37 @@ def crear_excel(resultado: dict[str, Any], longitud_barra: float, kerf_cm: float
     return salida.getvalue()
 
 
+def preparar_datos_para_optimizacion(df: pd.DataFrame) -> pd.DataFrame:
+    """Limpia datos editables antes de que lleguen a pandas u OR-Tools.
+
+    El PDF, DXF y st.data_editor pueden devolver textos como ``Ø 12`` o
+    `` 4 unidades ``. Esta función elimina dichos caracteres y deja tipos
+    numéricos estables para todas las operaciones de rango del solver.
+    """
+    datos = df.copy()
+    for columna in COLUMNAS:
+        if columna not in datos.columns:
+            datos[columna] = "" if columna == "Posición" else 0
+    datos["Posición"] = (datos["Posición"].fillna("").astype(str)
+                         .str.replace(r"\s+", " ", regex=True).str.strip())
+    # convertir_numero conserva cifras aunque vengan acompañadas por Ø, unidades
+    # o separadores decimales regionales.
+    datos["Cantidad"] = datos["Cantidad"].map(convertir_numero)
+    datos["Diámetro (mm)"] = datos["Diámetro (mm)"].map(convertir_numero)
+    datos["Longitud (m)"] = datos["Longitud (m)"].map(convertir_longitud_m)
+    # Conversión explícita requerida antes de cualquier range() o variable MIP.
+    datos["Cantidad"] = pd.to_numeric(datos["Cantidad"], errors="coerce").fillna(0).astype(int)
+    datos["Diámetro (mm)"] = pd.to_numeric(datos["Diámetro (mm)"], errors="coerce").fillna(0).astype(int)
+    datos["Longitud (m)"] = pd.to_numeric(datos["Longitud (m)"], errors="coerce").fillna(0.0).astype(float)
+    return datos[COLUMNAS]
+
+
 def validar_datos(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     errores: list[str] = []
-    datos = df.copy()
-    for columna in ("Diámetro (mm)", "Cantidad", "Longitud (m)"):
-        datos[columna] = pd.to_numeric(datos[columna], errors="coerce")
-    datos["Posición"] = datos["Posición"].fillna("").astype(str).str.strip()
-    datos = datos.dropna(subset=["Diámetro (mm)", "Cantidad", "Longitud (m)"])
+    datos = preparar_datos_para_optimizacion(df)
     datos = datos[(datos["Diámetro (mm)"] > 0) & (datos["Cantidad"] > 0) & (datos["Longitud (m)"] > 0)]
     if datos.empty:
         return pd.DataFrame(columns=COLUMNAS), ["Ingresa al menos una fila válida antes de optimizar."]
-    if not (datos["Cantidad"] % 1 == 0).all():
-        errores.append("La cantidad de cada posición debe ser un número entero.")
-    datos["Cantidad"] = datos["Cantidad"].round().astype(int)
-    datos["Diámetro (mm)"] = datos["Diámetro (mm)"].round(8)
     datos["Longitud (m)"] = datos["Longitud (m)"].round(4)
     for diametro in sorted(datos["Diámetro (mm)"].unique()):
         try: peso_nominal(float(diametro))
