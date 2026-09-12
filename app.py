@@ -266,30 +266,45 @@ def resolver_diametro(datos: pd.DataFrame, longitud_barra: float, kerf_m: float,
     etiquetas: dict[float, deque[str]] = defaultdict(deque)
     for _, fila in datos.sort_values(["Longitud (m)", "Posición"], ascending=[False, True]).iterrows():
         etiquetas[float(fila["Longitud (m)"])].extend([str(fila["Posición"])] * int(fila["Cantidad"]))
-    cortes: list[dict[str, Any]] = []
+    cortes_individuales: list[dict[str, Any]] = []
     retazos: list[dict[str, Any]] = []
-    numero_barra = 1
     for i, patron in enumerate(patrones):
         for _ in range(int(round(variables[i].solution_value()))):
             piezas, metros_piezas = [], 0.0
             for tipo, cantidad in enumerate(patron):
                 for _ in range(cantidad):
-                    piezas.append(f"{etiquetas[longitudes[tipo]].popleft()}: {longitudes[tipo]:.2f} m")
+                    piezas.append((etiquetas[longitudes[tipo]].popleft(), longitudes[tipo]))
                     metros_piezas += longitudes[tipo]
             sobrante_fisico = longitud_barra - metros_piezas - kerf_m * len(piezas)
             # Un déficit máximo de 1 cm es tolerancia admisible, no sobrante negativo.
             sobrante = max(0.0, sobrante_fisico)
             clasificacion = ("Sobrante de Stock" if sobrante + 1e-9 >= minimo_reutilizable
                              else "Desperdicio / Chatarra")
-            cortes.append({"Barra N°": numero_barra, "Piezas a cortar": " | ".join(piezas),
-                           "Metros de piezas": metros_piezas, "Kerf total (m)": kerf_m * len(piezas),
-                           "Sobrante (m)": sobrante, "Clasificación": clasificacion})
+            conteo_piezas: dict[tuple[str, float], int] = {}
+            for posicion, largo in piezas:
+                clave = (posicion, largo)
+                conteo_piezas[clave] = conteo_piezas.get(clave, 0) + 1
+            patron = " + ".join(
+                f"{cantidad}x {posicion} ({largo:.2f} m)"
+                for (posicion, largo), cantidad in conteo_piezas.items()
+            )
+            cortes_individuales.append({"Patrón de Corte": patron,
+                                        "Sobrante por Barra (m)": sobrante,
+                                        "Clasificación": clasificacion})
             if clasificacion == "Sobrante de Stock":
-                retazos.append({"Barra origen": numero_barra, "Longitud (m)": sobrante})
-            numero_barra += 1
-    return {"barras": numero_barra - 1, "cortes": cortes, "retazos": retazos,
+                retazos.append({"Longitud (m)": sobrante})
+    grupos: dict[tuple[str, float, str], int] = {}
+    for corte in cortes_individuales:
+        clave = (corte["Patrón de Corte"], round(corte["Sobrante por Barra (m)"], 6), corte["Clasificación"])
+        grupos[clave] = grupos.get(clave, 0) + 1
+    cortes = [
+        {"Cantidad de Barras": cantidad, "Patrón de Corte": patron,
+         "Sobrante por Barra (m)": sobrante, "Clasificación": clasificacion}
+        for (patron, sobrante, clasificacion), cantidad in grupos.items()
+    ]
+    return {"barras": len(cortes_individuales), "cortes": cortes, "retazos": retazos,
             "metros_piezas": sum(largo * cantidad for largo, cantidad in zip(longitudes, demandas)),
-            "metros_chatarra": sum(c["Sobrante (m)"] for c in cortes
+            "metros_chatarra": sum(c["Sobrante por Barra (m)"] for c in cortes_individuales
                                     if c["Clasificación"] == "Desperdicio / Chatarra")}
 
 
@@ -311,9 +326,21 @@ def optimizar(datos: pd.DataFrame, longitud_barra: float, kerf_cm: float,
                         "Kg de piezas": solucion["metros_piezas"] * peso,
                         "Kg de chatarra": solucion["metros_chatarra"] * peso})
     df_resumen = pd.DataFrame(resumen)
+    df_cortes = pd.DataFrame(cortes)
+    if not df_cortes.empty:
+        df_cortes = df_cortes[["Cantidad de Barras", "Diámetro (mm)", "Patrón de Corte",
+                               "Sobrante por Barra (m)", "Clasificación"]]
+    df_retazos = pd.DataFrame(retazos)
+    if not df_retazos.empty:
+        df_retazos["Longitud (m)"] = df_retazos["Longitud (m)"].round(2)
+        df_retazos = (df_retazos.groupby(["Diámetro (mm)", "Longitud (m)"], as_index=False)
+                     .size().rename(columns={"size": "Cantidad"})
+                     .sort_values(["Diámetro (mm)", "Longitud (m)"], ascending=[True, False]))
+    else:
+        df_retazos = pd.DataFrame(columns=["Diámetro (mm)", "Longitud (m)", "Cantidad"])
     total_barras = int(df_resumen["Barras a comprar"].sum())
     metros_piezas = float(df_resumen["Metros de piezas"].sum())
-    return {"resumen": df_resumen, "cortes": pd.DataFrame(cortes), "retazos": pd.DataFrame(retazos),
+    return {"resumen": df_resumen, "cortes": df_cortes, "retazos": df_retazos,
             "aprovechamiento": 100 * metros_piezas / (total_barras * longitud_barra) if total_barras else 0.0,
             "kg_total": float(df_resumen["Kg de piezas"].sum()),
             "kg_chatarra": float(df_resumen["Kg de chatarra"].sum())}
@@ -321,7 +348,7 @@ def optimizar(datos: pd.DataFrame, longitud_barra: float, kerf_cm: float,
 
 def redondear_para_mostrar(df: pd.DataFrame) -> pd.DataFrame:
     resultado = df.copy()
-    enteros = {"Barra N°", "Barras a comprar", "Barra origen"}
+    enteros = {"Cantidad de Barras", "Barras a comprar", "Cantidad"}
     for columna in resultado.select_dtypes(include="number").columns:
         if columna not in enteros:
             resultado[columna] = resultado[columna].round(2)
@@ -355,14 +382,14 @@ def crear_excel(resultado: dict[str, Any], longitud_barra: float, kerf_cm: float
         hoja.set_column("A:A", 18); hoja.set_column("B:E", 20, dos_decimales)
 
         detalle = resultado["cortes"].copy()
-        detalle.to_excel(escritor, sheet_name="Plan de Corte Detallado", index=False)
-        hoja = escritor.sheets["Plan de Corte Detallado"]
+        detalle.to_excel(escritor, sheet_name="Plan de Corte Agrupado", index=False)
+        hoja = escritor.sheets["Plan de Corte Agrupado"]
         for i, nombre in enumerate(detalle.columns): hoja.write(0, i, nombre, encabezado)
-        hoja.set_column("A:B", 16); hoja.set_column("C:C", 65); hoja.set_column("D:G", 22, dos_decimales)
+        hoja.set_column("A:B", 18); hoja.set_column("C:C", 65); hoja.set_column("D:D", 24, dos_decimales); hoja.set_column("E:E", 24)
 
         inventario = resultado["retazos"].copy()
         if inventario.empty:
-            inventario = pd.DataFrame(columns=["Diámetro (mm)", "Barra origen", "Longitud (m)"])
+            inventario = pd.DataFrame(columns=["Diámetro (mm)", "Longitud (m)", "Cantidad"])
         inventario.to_excel(escritor, sheet_name="Inventario Sobrantes Stock", index=False)
         hoja = escritor.sheets["Inventario Sobrantes Stock"]
         for i, nombre in enumerate(inventario.columns): hoja.write(0, i, nombre, encabezado)
@@ -442,17 +469,20 @@ if st.button("Optimizar plan de corte", type="primary", use_container_width=True
 
 if "resultado" in st.session_state:
     resultado = st.session_state.resultado
-    st.subheader("Resultado")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Barras a comprar", int(resultado["resumen"]["Barras a comprar"].sum()))
-    col2.metric("Aprovechamiento global", f"{resultado['aprovechamiento']:.2f}%")
-    col3.metric("Chatarra estimada", f"{resultado['kg_chatarra']:.2f} kg")
+    st.subheader("Resumen ejecutivo")
+    kpis = st.columns(len(resultado["resumen"]) + 3)
+    for indice, fila in resultado["resumen"].reset_index(drop=True).iterrows():
+        kpis[indice].metric(f"Barras Ø {fila['Diámetro (mm)']:.0f} mm", int(fila["Barras a comprar"]))
+    inicio_global = len(resultado["resumen"])
+    kpis[inicio_global].metric("Acero requerido", f"{resultado['kg_total']:.2f} kg")
+    kpis[inicio_global + 1].metric("Aprovechamiento global", f"{resultado['aprovechamiento']:.2f}%")
+    kpis[inicio_global + 2].metric("Chatarra generada", f"{resultado['kg_chatarra']:.2f} kg")
+    st.subheader("Resumen por diámetro")
     st.dataframe(redondear_para_mostrar(resultado["resumen"]), use_container_width=True, hide_index=True)
-    st.subheader("Plan de corte detallado")
+    st.subheader("Plan de corte agrupado")
     st.dataframe(redondear_para_mostrar(resultado["cortes"]), use_container_width=True, hide_index=True)
     st.subheader("Inventario de sobrantes de stock")
     st.dataframe(redondear_para_mostrar(resultado["retazos"]), use_container_width=True, hide_index=True)
     st.download_button("Descargar reporte Excel", data=crear_excel(resultado, *st.session_state.config_resultado),
                        file_name="plan_corte_acero.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                        use_container_width=True)
-
